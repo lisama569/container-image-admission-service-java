@@ -8,11 +8,14 @@ import com.github.lisama569.containerimageadmissionservicejava.domain.Evidence;
 import com.github.lisama569.containerimageadmissionservicejava.domain.ImageRef;
 import com.github.lisama569.containerimageadmissionservicejava.domain.Policy;
 import com.github.lisama569.containerimageadmissionservicejava.domain.PolicySnapshot;
+import com.github.lisama569.containerimageadmissionservicejava.domain.TemporaryException;
 import com.github.lisama569.containerimageadmissionservicejava.evidence.EvidenceValidator;
+import com.github.lisama569.containerimageadmissionservicejava.exception.TemporaryExceptionStore;
 import com.github.lisama569.containerimageadmissionservicejava.policy.PolicyEngine;
 import com.github.lisama569.containerimageadmissionservicejava.policy.PolicyStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.time.Clock;
@@ -27,12 +30,15 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
 
 /**
- * 准入评估服务：编排策略快照、证据校验、缓存与审计。
+ * 准入评估服务：编排策略快照、临时例外、证据校验、缓存与审计。
  *
  * <p>一致性保证：
  * <ul>
  *   <li>每次评估只基于一个 {@link PolicySnapshot}；</li>
- *   <li>缓存键包含策略版本与证据指纹，策略变更或证据新增/失效后旧结论自动失效；</li>
+ *   <li>缓存键包含策略版本、策略代次（generation）、例外版本与证据指纹，
+ *       策略发布/回滚、例外新增/撤销或证据变化后旧结论自动失效；
+ *       缓存条目的 validUntil 同时受证据与例外最早到期时间约束，
+ *       例外一到期旧的放行结论立即不可再用；</li>
  *   <li>同一缓存键的并发评估通过 computeIfAbsent 只计算一次；</li>
  *   <li>审计按 requestId 幂等，重复请求不产生重复记录。</li>
  * </ul>
@@ -46,19 +52,29 @@ public class AdmissionService {
     private final PolicyEngine policyEngine;
     private final EvidenceValidator evidenceValidator;
     private final AuditLog auditLog;
-    /** 缓存条目：validUntil 为证据中最早的过期时间，到期后旧结论失效。 */
+    private final TemporaryExceptionStore exceptionStore;
+    /** 缓存条目：validUntil 为证据/例外中最早的过期时间，到期后旧结论失效。 */
     private record CachedDecision(EvaluationDecision decision, Instant validUntil) {
     }
 
     private final ConcurrentMap<String, CachedDecision> cache = new ConcurrentHashMap<>();
     private volatile Clock clock = Clock.systemUTC();
 
+    @Autowired
     public AdmissionService(PolicyStore policyStore, PolicyEngine policyEngine,
-                            EvidenceValidator evidenceValidator, AuditLog auditLog) {
+                            EvidenceValidator evidenceValidator, AuditLog auditLog,
+                            TemporaryExceptionStore exceptionStore) {
         this.policyStore = policyStore;
         this.policyEngine = policyEngine;
         this.evidenceValidator = evidenceValidator;
         this.auditLog = auditLog;
+        this.exceptionStore = exceptionStore;
+    }
+
+    /** 兼容无例外存储的装配方式（单元测试使用）。 */
+    public AdmissionService(PolicyStore policyStore, PolicyEngine policyEngine,
+                            EvidenceValidator evidenceValidator, AuditLog auditLog) {
+        this(policyStore, policyEngine, evidenceValidator, auditLog, null);
     }
 
     /** 测试用：注入固定时钟。 */
@@ -67,19 +83,27 @@ public class AdmissionService {
     }
 
     public EvaluationDecision evaluate(EvaluationRequest request) {
-        // 缓存键包含策略版本与证据指纹：策略或证据变化后旧结论不再命中
+        // 缓存键包含策略版本/代次、例外版本与证据指纹：发布、回滚、例外变化或证据变化后旧结论不再命中
         PolicySnapshot snapshot = policyStore.snapshot();
         String cacheKey = cacheKey(request, snapshot.version());
         Instant now = clock.instant();
         CachedDecision entry = cache.compute(cacheKey, (k, existing) -> {
-            // 证据已过期（失效）的缓存结论不得继续生效
+            // 证据或例外已过期（失效）的缓存结论不得继续生效
             if (existing != null && (existing.validUntil() == null || now.isBefore(existing.validUntil()))) {
                 return existing;
             }
-            return new CachedDecision(doEvaluate(request, snapshot), earliestExpiry(request));
+            return new CachedDecision(doEvaluate(request, snapshot), entryValidUntil(request, now));
         });
         auditLog.record(request.requestId(), entry.decision());
         return entry.decision();
+    }
+
+    /**
+     * 静默评估：基于任意策略快照计算结论，但<strong>不</strong>读/写缓存、<strong>不</strong>写审计。
+     * 专供候选策略预演使用——预演只是看结果，不能影响线上判定，也不能留下正式判定记录。
+     */
+    public EvaluationDecision evaluateSilently(EvaluationRequest request, PolicySnapshot snapshot) {
+        return doEvaluate(request, snapshot);
     }
 
     private EvaluationDecision doEvaluate(EvaluationRequest request, PolicySnapshot snapshot) {
@@ -124,24 +148,34 @@ public class AdmissionService {
                     "证据绑定的摘要互相冲突: " + distinctDigests);
         }
 
-        // 6. 策略作用域解析
+        // 6. 策略作用域解析（即便后续被例外覆盖，也保留命中规则便于解释）
         List<Policy.PolicyRule> matched = policyEngine.matchRules(snapshot, image);
+        List<String> matchedRuleIds = matched.stream().map(Policy.PolicyRule::ruleId).toList();
+
+        // 7. 临时例外：有效期内命中的最高优先级例外覆盖正常策略判定；
+        //    过期/撤销/创建即无效的例外不会出现在 activeAt 中，绝不残留。
+        TemporaryException applied = activeException(image, now);
+        if (applied != null) {
+            return applyException(applied, image, canonical, policyVersion,
+                    matchedRuleIds, evidenceList, effectiveDigest, now);
+        }
+
+        // 8. 无例外时，没有命中任何策略规则默认拒绝
         if (matched.isEmpty()) {
             return deny(DenyReason.NO_APPLICABLE_POLICY, canonical, policyVersion,
                     "没有命中任何策略规则，默认拒绝");
         }
-        List<String> matchedRuleIds = matched.stream().map(Policy.PolicyRule::ruleId).toList();
 
-        // 7. 冲突处理：排序后第一条规则的效果生效
+        // 9. 冲突处理：排序后第一条规则的效果生效
         Policy.PolicyRule winner = matched.get(0);
         if (winner.effect() == Policy.Effect.DENY) {
             return new EvaluationDecision(EvaluationDecision.Verdict.DENY,
                     DenyReason.POLICY_EXPLICIT_DENY, canonical, policyVersion,
                     matchedRuleIds, List.of(),
-                    "命中显式拒绝规则 " + winner.ruleId());
+                    "命中显式拒绝规则 " + winner.ruleId(), null);
         }
 
-        // 8. 证据校验：收集所需类型，缺失时区分原因
+        // 10. 证据校验：收集所需类型，缺失时区分原因
         List<Evidence> valid = evidenceValidator.validEvidence(evidenceList, effectiveDigest, now);
         Set<Evidence.EvidenceType> validTypes = valid.stream().map(Evidence::type).collect(Collectors.toSet());
         List<Evidence.EvidenceType> required = winner.requiredEvidence() != null
@@ -171,10 +205,10 @@ public class AdmissionService {
             }
             return new EvaluationDecision(EvaluationDecision.Verdict.DENY, reason, canonical,
                     policyVersion, matchedRuleIds,
-                    evidenceList.stream().map(Evidence::id).toList(), detail);
+                    evidenceList.stream().map(Evidence::id).toList(), detail, null);
         }
 
-        // 9. 准入
+        // 11. 准入
         List<String> evidenceIds = valid.stream().map(Evidence::id).sorted().toList();
         EvaluationDecision decision = EvaluationDecision.allow(canonical, policyVersion,
                 matchedRuleIds, evidenceIds,
@@ -182,6 +216,63 @@ public class AdmissionService {
         log.info("admission image={} verdict=ALLOW policyVersion={} matchedRules={} evidence={}",
                 canonical, policyVersion, matchedRuleIds, evidenceIds);
         return decision;
+    }
+
+    /** 找到当前时刻有效且作用域命中的最高优先级例外；无则 null。 */
+    private TemporaryException activeException(ImageRef image, Instant now) {
+        if (exceptionStore == null) {
+            return null;
+        }
+        return exceptionStore.activeAt(now).stream()
+                .filter(e -> policyEngine.scopeMatches(e.scopePattern(), image))
+                .findFirst()
+                .orElse(null);
+    }
+
+    /** 按例外产出结论：ALLOW 例外豁免证据要求，DENY 例外显式拒绝。 */
+    private EvaluationDecision applyException(TemporaryException exception, ImageRef image,
+                                              String canonical, long policyVersion,
+                                              List<String> matchedRuleIds, List<Evidence> evidenceList,
+                                              String effectiveDigest, Instant now) {
+        String digest = image.digest() != null ? image.digest() : effectiveDigest;
+        if (exception.effect() == Policy.Effect.DENY) {
+            log.info("admission image={} verdict=DENY reason=TEMPORARY_EXCEPTION_DENIED "
+                            + "policyVersion={} exceptionId={} expiresAt={}",
+                    canonical, policyVersion, exception.id(), exception.expiresAt());
+            return EvaluationDecision.deny(DenyReason.TEMPORARY_EXCEPTION_DENIED, canonical,
+                    policyVersion, matchedRuleIds, List.of(),
+                    "命中临时拒绝例外 " + exception.id()
+                            + (exception.reason() != null ? "（" + exception.reason() + "）" : "")
+                            + "，到期时间 " + exception.expiresAt(),
+                    exception.id());
+        }
+        // ALLOW 例外：豁免该作用域的必需证据要求；仍如实记录已有有效证据
+        List<String> evidenceIds = evidenceValidator
+                .validEvidence(evidenceList, digest, now).stream()
+                .map(Evidence::id).sorted().toList();
+        log.info("admission image={} verdict=ALLOW policyVersion={} exceptionId={} expiresAt={} "
+                        + "matchedRules={} evidence={}",
+                canonical, policyVersion, exception.id(), exception.expiresAt(),
+                matchedRuleIds, evidenceIds);
+        return EvaluationDecision.allow(canonical, policyVersion, matchedRuleIds, evidenceIds,
+                "命中临时放行例外 " + exception.id()
+                        + (exception.reason() != null ? "（" + exception.reason() + "）" : "")
+                        + "，豁免证据要求，到期时间 " + exception.expiresAt(),
+                exception.id());
+    }
+
+    /** 缓存条目失效时间：证据最早到期与例外最早到期取较早者。 */
+    private Instant entryValidUntil(EvaluationRequest request, Instant now) {
+        Instant evidenceExpiry = earliestExpiry(request);
+        Instant exceptionExpiry = exceptionStore != null
+                ? exceptionStore.earliestExpiry(now) : null;
+        if (evidenceExpiry == null) {
+            return exceptionExpiry;
+        }
+        if (exceptionExpiry == null) {
+            return evidenceExpiry;
+        }
+        return evidenceExpiry.isBefore(exceptionExpiry) ? evidenceExpiry : exceptionExpiry;
     }
 
     /** 证据中最早的过期时间；无过期时间返回 null（不过期）。 */
@@ -203,7 +294,7 @@ public class AdmissionService {
                 List.of(), List.of(), detail);
     }
 
-    /** 缓存键：镜像 + 解析摘要 + 策略版本 + 证据指纹。 */
+    /** 缓存键：镜像 + 解析摘要 + 策略版本 + 策略代次 + 例外版本 + 证据指纹。 */
     private String cacheKey(EvaluationRequest request, long policyVersion) {
         List<Evidence> evidenceList = request.evidenceList() != null ? request.evidenceList() : List.of();
         String fingerprint = evidenceList.stream()
@@ -212,8 +303,13 @@ public class AdmissionService {
                         String.valueOf(e.expiresAt())))
                 .sorted()
                 .collect(Collectors.joining(";"));
+        long generation = policyStore.generation();
+        long exceptionVersion = exceptionStore != null ? exceptionStore.version() : 0L;
         return String.join("#", String.valueOf(request.imageRef()),
                 String.valueOf(request.resolvedDigest()),
-                String.valueOf(policyVersion), fingerprint);
+                String.valueOf(policyVersion),
+                String.valueOf(generation),
+                String.valueOf(exceptionVersion),
+                fingerprint);
     }
 }

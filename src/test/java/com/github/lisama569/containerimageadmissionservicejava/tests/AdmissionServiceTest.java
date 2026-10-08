@@ -292,13 +292,19 @@ class AdmissionServiceTest {
         pool.shutdown();
         assertTrue(pool.awaitTermination(60, TimeUnit.SECONDS));
         assertTrue(errors.isEmpty(), "并发执行不应出错: " + errors);
-        // 每条结论都必须基于某个一致的策略快照（版本号单调、结论可解释）
+        // 每条结论都必须基于某个一致的策略快照（版本号单调、结论可解释）：
+        // 评估线程可能在任何一次 update 之前/之后拿到快照——v1 是默认规则 default-require-scan-and-signature
+        // （带齐证据时 ALLOW），v2+ 是测试里切换的规则 r；两者都是某个一致快照的合法结果，
+        // 关键是同一次评估不能混用两个快照的规则。
         for (EvaluationDecision d : results) {
             assertTrue(d.policyVersion() >= 1);
             if (d.verdict() == EvaluationDecision.Verdict.ALLOW) {
-                assertEquals(List.of("r"), d.matchedRuleIds());
+                assertTrue(List.of("r", "default-require-scan-and-signature")
+                                .containsAll(d.matchedRuleIds()) && d.matchedRuleIds().size() == 1,
+                        "ALLOW 结论必须整体来自某一个一致快照的规则: " + d.matchedRuleIds());
             } else {
                 assertEquals(DenyReason.POLICY_EXPLICIT_DENY, d.denyReason());
+                assertEquals(List.of("r"), d.matchedRuleIds());
             }
         }
     }
