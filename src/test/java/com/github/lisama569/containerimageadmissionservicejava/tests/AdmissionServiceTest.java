@@ -296,7 +296,11 @@ class AdmissionServiceTest {
         for (EvaluationDecision d : results) {
             assertTrue(d.policyVersion() >= 1);
             if (d.verdict() == EvaluationDecision.Verdict.ALLOW) {
-                assertEquals(List.of("r"), d.matchedRuleIds());
+                // 可能读到更新后的规则 r（证据满足要求），也可能在任何更新前读到
+                // 初始 v1 默认规则 default-require-scan-and-signature（同样要求扫描+签名）
+                assertTrue(d.matchedRuleIds().equals(List.of("r"))
+                                || d.matchedRuleIds().equals(List.of("default-require-scan-and-signature")),
+                        "ALLOW 结论必须整体基于某一个一致快照的规则，实际: " + d.matchedRuleIds());
             } else {
                 assertEquals(DenyReason.POLICY_EXPLICIT_DENY, d.denyReason());
             }
